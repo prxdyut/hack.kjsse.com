@@ -81,7 +81,7 @@ export class MCPClient {
     ];
 
     const response = await this.anthropic.messages.create({
-      model: "claude-3-haiku-20240307",
+      model: "claude-3-5-haiku-20241022",
       max_tokens: 250,
       messages,
       tools: this.tools,
@@ -90,12 +90,17 @@ export class MCPClient {
     const finalText = [];
     const toolResults = [];
 
+    console.log("primary:", response.content)
+
     for (const content of response.content) {
       if (content.type === "text") {
         finalText.push(content.text);
       } else if (content.type === "tool_use") {
         const toolName = content.name;
         const toolArgs = content.input as { [x: string]: unknown } | undefined;
+
+        console.log("toolName:", toolName)
+        console.log("toolArgs:", toolArgs)
 
         const result = await this.mcp.callTool({
           name: toolName,
@@ -112,11 +117,11 @@ export class MCPClient {
         });
 
         const response = await this.anthropic.messages.create({
-          model: "claude-3-5-sonnet-20241022",
+          model: "claude-3-5-haiku-20241022",
           max_tokens: 1000,
           messages,
         });
-
+console.log(response.content)
         finalText.push(
           response.content[0].type === "text" ? response.content[0].text : ""
         );

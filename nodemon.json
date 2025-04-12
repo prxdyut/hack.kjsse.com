@@ -1,5 +1,0 @@
-{
-  "watch": ["vt"],
-  "ext": "ts",
-  "exec": "npx ts-node ./vt/app.ts"
-} 
