@@ -1,4 +1,6 @@
 import { useState, useRef, useEffect, ChangeEvent, FormEvent } from 'react'
+import { virusTotalService } from '../services/virustotal'
+import { VTResult } from '../types/virustotal'
 
 // Using CustomFile to avoid conflict with DOM File type
 interface CustomFile {
@@ -31,7 +33,7 @@ interface StaticAnalysis {
   positiveScans: number
   fileInfo: FileInfo
   signatures: Signature[]
-  virusTotal: VirusTotalResult
+  virusTotal: VTResult
 }
 
 interface FileInfo {
@@ -49,21 +51,6 @@ interface Signature {
   description: string
   severity: 'low' | 'medium' | 'high' | 'critical'
   category: 'malware' | 'pup' | 'adware' | 'suspicious' | 'clean'
-}
-
-interface VirusTotalResult {
-  permalink: string
-  scanDate: Date
-  positives: number
-  total: number
-  scans: { [engine: string]: ScanResult }
-}
-
-interface ScanResult {
-  detected: boolean
-  version: string
-  result: string | null
-  update: string
 }
 
 // Dynamic Analysis Interfaces
@@ -400,55 +387,145 @@ export default function Chat() {
     setScanLevel(level)
   }
 
-  const runFullScan = () => {
-    if (files.length === 0) return
-    
-    // Mark all files as processing
-    setFiles(files.map(file => ({
-      ...file,
-      status: 'processing',
-      progress: 0
-    })))
-    
-    // Process all files
-    files.forEach(file => {
-      const interval = setInterval(() => {
-        setFiles(prev => 
-          prev.map(f => 
-            f.id === file.id 
-              ? { 
-                  ...f, 
-                  progress: (f.progress ?? 0) < 100 ? (f.progress ?? 0) + 5 : 100,
-                  status: (f.progress ?? 0) >= 95 ? 'completed' : 'processing'
-                }
+  const runFullScan = async (fileId: string, fileName: string, scanLevel: string) => {
+    if (!fileId || !fileName) {
+      console.error('Invalid file information provided');
+      return;
+    }
+
+    // Mark file as processing
+    setFiles(prev => prev.map(f => 
+      f.id === fileId 
+        ? { ...f, status: 'processing' as const, progress: 0 } 
+        : f
+    ));
+
+    try {
+      // Get the original file
+      const fileToScan = files.find(f => f.id === fileId);
+      if (!fileToScan?.originalFile) {
+        throw new Error('Original file not found');
+      }
+
+      // Start VirusTotal scan
+      const vtAnalysisId = await virusTotalService.uploadFile(fileToScan.originalFile);
+
+      // Start polling for VirusTotal results
+      virusTotalService.startPolling(
+        vtAnalysisId,
+        (result) => {
+          setFiles(prev => {
+            const updatedFiles = prev.map(f => {
+              if (f.id === fileId) {
+                // Create static analysis
+                const staticAnalysis: StaticAnalysis = {
+                  scanId: vtAnalysisId,
+                  scanDate: result.uploadDate,
+                  detectionRate: result.detectionRatio?.detected || 0 / (result.detectionRatio?.total || 1),
+                  totalScans: result.detectionRatio?.total || 0,
+                  positiveScans: result.detectionRatio?.detected || 0,
+                  fileInfo: {
+                    md5: result.md5,
+                    sha1: result.sha1,
+                    sha256: result.sha256,
+                    fileSize: result.fileSize,
+                    fileType: result.fileType,
+                    magic: result.fileInfo?.magic || '',
+                    compilationTimestamp: result.fileInfo?.peInfo?.timestamp
+                  },
+                  signatures: [], // Will be populated based on detections
+                  virusTotal: result
+                };
+
+                // Add VirusTotal signatures
+                Object.entries(result.engineResults).forEach(([engine, result]) => {
+                  if (result.detected && result.result) {
+                    staticAnalysis.signatures.push({
+                      name: `VT: ${engine}: ${result.result}`,
+                      description: `Detection by ${engine} antivirus`,
+                      severity: 'high',
+                      category: 'malware' as const
+                    });
+                  }
+                });
+
+                // Create analysis report
+                const analysisReport: AnalysisReport = {
+                  reportId: `report-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                  fileId,
+                  fileName,
+                  overallVerdict: result.stats.malicious > 0 ? 'malicious' : 
+                                 result.stats.suspicious > 0 ? 'suspicious' : 'clean',
+                  threatScore: ((result.stats.malicious * 3 + result.stats.suspicious) * 100) / (result.detectionRatio?.total || 1),
+                  staticAnalysis,
+                  analyzedAt: new Date()
+                };
+
+                return {
+                  ...f,
+                  status: 'completed' as 'completed',
+                  progress: 100,
+                  analysisReport
+                };
+              }
+              return f;
+            });
+
+            // Update selected file if it's the one being processed
+            const updatedFile = updatedFiles.find(f => f.id === fileId);
+            if (updatedFile) {
+              setSelectedFile(updatedFile);
+            }
+
+            return updatedFiles;
+          });
+
+          // If deep scan is requested, proceed with dynamic analysis
+          if (scanLevel === 'deep') {
+            runDynamicAnalysis(fileId, fileName);
+          }
+        },
+        (error) => {
+          console.error('VirusTotal scan failed:', error);
+          setFiles(prev => prev.map(f => 
+            f.id === fileId 
+              ? { ...f, status: 'error' as const } 
               : f
-          )
-        )
-      }, 200)
-      
-      // Complete the scan based on scan level
-      const timeToComplete = scanLevel === 'basic' ? 3000 : 5000
-      
-      setTimeout(() => {
-        clearInterval(interval)
-        setFiles(prev => 
-          prev.map(f => 
-            f.id === file.id ? { 
-              ...f, 
-              status: 'completed', 
-              progress: 100,
-              analysisReport: generateMockAnalysisReport(f.id, f.name, scanLevel === 'basic' ? 'static' : 'deep')
-            } : f
-          )
-        )
-      }, timeToComplete)
-    })
-  }
+          ));
+        }
+      );
+
+      // Simulate upload progress while waiting for results
+      const progressInterval = setInterval(() => {
+        setFiles(prev => {
+          const file = prev.find(f => f.id === fileId);
+          if (file?.status === 'processing' && file.progress && file.progress < 90) {
+            const updatedFiles = prev.map(f => 
+              f.id === fileId 
+                ? { ...f, progress: (f.progress || 0) + Math.random() * 10 } 
+                : f
+            );
+            return updatedFiles;
+          }
+          clearInterval(progressInterval);
+          return prev;
+        });
+      }, 1000);
+
+    } catch (error) {
+      console.error('Scan failed:', error);
+      setFiles(prev => prev.map(f => 
+        f.id === fileId 
+          ? { ...f, status: 'error' as const } 
+          : f
+      ));
+    }
+  };
 
   // Run dynamic analysis on a file
   const runDynamicAnalysis = (fileId: string, fileName: string) => {
     // Mark file as processing
-    setFiles(prev => 
+    setFiles((prev: any[]) => 
       prev.map(f => 
         f.id === fileId 
           ? { 
@@ -474,13 +551,13 @@ export default function Chat() {
     
     // Simulate processing
     const interval = setInterval(() => {
-      setFiles(prev => {
+      setFiles((prev) => {
         const updatedFiles = prev.map(f => 
           f.id === fileId 
             ? { 
                 ...f, 
                 progress: (f.progress ?? 0) < 100 ? (f.progress ?? 0) + 5 : 100,
-                status: (f.progress ?? 0) >= 95 ? 'completed' : 'processing'
+                status: ((f.progress ?? 0) >= 95 ? 'completed' : 'processing') as const
               } 
             : f
         );
@@ -501,7 +578,7 @@ export default function Chat() {
     setTimeout(() => {
       clearInterval(interval)
       
-      setFiles(prev => {
+      setFiles((prev: CustomFile[]) => {
         const updatedFiles = prev.map(f => {
           if (f.id === fileId) {
             // Get the existing report if it exists
@@ -531,19 +608,19 @@ export default function Chat() {
             
             return { 
               ...f, 
-              status: 'completed', 
+              status: 'completed' as const, 
               progress: 100,
               analysisReport: updatedReport
             };
           }
-          return f;
+          return f as CustomFile;
         });
         
         // Update selectedFile with the processed file data
         if (selectedFile && selectedFile.id === fileId) {
           const updatedFile = updatedFiles.find(f => f.id === fileId);
           if (updatedFile) {
-            setSelectedFile(updatedFile);
+            setSelectedFile(updatedFile as unknown as CustomFile);
             // Switch to dynamic analysis tab
             setActiveReportTab('dynamic');
           }
@@ -575,11 +652,31 @@ export default function Chat() {
       },
       signatures: [],
       virusTotal: {
-        permalink: `https://www.virustotal.com/gui/file/${Array(64).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}/detection`,
-        scanDate: new Date(),
-        positives: Math.floor(Math.random() * 3), // 0-2 positive detections
-        total: 68,
-        scans: {
+        scanId: `scan-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+        sha256: Array(64).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join(''),
+        sha1: Array(40).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join(''),
+        md5: Array(32).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join(''),
+        date: new Date(),
+        fileName: fileName,
+        fileSize: Math.floor(Math.random() * 10000000) + 1000,
+        fileType: fileName.split('.').pop()?.toUpperCase() || 'UNKNOWN',
+        uploadDate: new Date(),
+        status: 'completed' as const,
+        stats: {
+          harmless: Math.floor(Math.random() * 50),
+          type_unsupported: Math.floor(Math.random() * 5),
+          suspicious: Math.floor(Math.random() * 3),
+          confirmed_timeout: 0,
+          timeout: Math.floor(Math.random() * 2),
+          failure: 0,
+          malicious: Math.floor(Math.random() * 3),
+          undetected: Math.floor(Math.random() * 20)
+        },
+        detectionRatio: {
+          detected: Math.floor(Math.random() * 3),
+          total: 68
+        },
+        engineResults: {
           'Windows Defender': {
             detected: Math.random() > 0.9,
             version: '1.1.19800.4',
@@ -591,26 +688,20 @@ export default function Chat() {
             version: '21.0.1.45',
             result: Math.random() > 0.9 ? 'HEUR:Trojan.Win32.Generic' : null,
             update: '20230601'
-          },
-          'McAfee': {
-            detected: Math.random() > 0.9,
-            version: '6.0.6.653',
-            result: Math.random() > 0.9 ? 'W32/Obfuscated.Y' : null,
-            update: '20230601'
-          },
-          'ClamAV': {
-            detected: Math.random() > 0.9,
-            version: '0.104.0.0',
-            result: Math.random() > 0.9 ? 'Win.Trojan.Generic-9829433-0' : null,
-            update: '20230601'
-          },
-          'Symantec': {
-            detected: Math.random() > 0.9,
-            version: '1.17.0.0',
-            result: Math.random() > 0.9 ? 'Trojan.Gen.2' : null,
-            update: '20230601'
           }
-        }
+        },
+        fileInfo: {
+          magic: 'PE32 executable for MS Windows',
+          type: fileName.split('.').pop()?.toUpperCase() || 'UNKNOWN',
+          reputation: Math.floor(Math.random() * 100) - 50,
+          firstSeen: new Date(Date.now() - Math.floor(Math.random() * 10000000000)),
+          timesSubmitted: Math.floor(Math.random() * 100),
+          communityVotes: {
+            harmless: Math.floor(Math.random() * 50),
+            malicious: Math.floor(Math.random() * 10)
+          }
+        },
+        permalink: `https://www.virustotal.com/gui/file/${Array(64).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}/detection`
       }
     }
 
@@ -1146,28 +1237,28 @@ export default function Chat() {
                                 ? darkMode ? 'text-amber-400' : 'text-amber-600'
                                 : darkMode ? 'text-red-400' : 'text-red-600'
                             }`}>
-                              {selectedFile.analysisReport.threatScore}/100
+                              {Math.round(Math.min(Math.max(selectedFile.analysisReport.threatScore, 0), 100))}
                             </span>
                           </div>
                           <div 
-                            className="w-full bg-gray-300 rounded-full h-2"
+                            className="w-full bg-gray-300 rounded-full h-2 overflow-hidden"
                             role="progressbar"
                             aria-valuemin={0}
                             aria-valuemax={100}
-                            aria-valuenow={selectedFile.analysisReport.threatScore}
+                            aria-valuenow={Math.min(Math.max(selectedFile.analysisReport.threatScore, 0), 100)}
                           >
                             <div 
                               className={`h-2 rounded-full ${
-                                selectedFile.analysisReport.threatScore < 30
+                                Math.min(Math.max(selectedFile.analysisReport.threatScore, 0), 100) < 30
                                   ? 'bg-emerald-500'
-                                  : selectedFile.analysisReport.threatScore < 70
+                                  : Math.min(Math.max(selectedFile.analysisReport.threatScore, 0), 100) < 70
                                   ? 'bg-amber-500'
                                   : 'bg-red-500'
                               }`} 
-                              style={{width: `${selectedFile.analysisReport.threatScore}%`}}
+                              style={{width: `${Math.min(Math.max(selectedFile.analysisReport.threatScore, 0), 100)}%`}}
                             ></div>
+                          </div>
                     </div>
-                  </div>
                   
                         <div className="text-xs grid grid-cols-2 gap-2">
                           <div>
@@ -1275,73 +1366,6 @@ export default function Chat() {
                                 </span>
                               </div>
                             </div>
-                          </div>
-                          
-                          {/* VirusTotal Results */}
-                          <div className={`${
-                            darkMode 
-                              ? 'bg-slate-800/40 border-emerald-900/30' 
-                              : 'bg-white border-gray-200'
-                            } rounded-lg p-3 border`}
-                          >
-                            <div className="flex justify-between items-center mb-2">
-                              <h5 className={`text-xs font-medium ${darkMode ? 'text-slate-300' : 'text-gray-700'}`}>
-                                VirusTotal Results
-                              </h5>
-                              <span className={`text-xs ${
-                                selectedFile.analysisReport.staticAnalysis.virusTotal.positives > 0
-                                  ? darkMode ? 'text-red-400' : 'text-red-600'
-                                  : darkMode ? 'text-emerald-400' : 'text-emerald-600'
-                              }`}>
-                                {selectedFile.analysisReport.staticAnalysis.virusTotal.positives} / {selectedFile.analysisReport.staticAnalysis.virusTotal.total} detections
-                              </span>
-                            </div>
-                            
-                            <div className="space-y-2 mt-3">
-                              {Object.entries(selectedFile.analysisReport.staticAnalysis.virusTotal.scans)
-                                .map(([engine, result], index) => (
-                                  <div 
-                                    key={index} 
-                                    className={`flex justify-between items-center p-2 rounded-md ${
-                                      result.detected
-                                        ? darkMode ? 'bg-red-900/20' : 'bg-red-50'
-                                        : darkMode ? 'bg-slate-700/30' : 'bg-gray-50'
-                                    }`}
-                                  >
-                                    <div className="flex items-center">
-                                      <div className={`w-2 h-2 rounded-full mr-2 ${
-                                        result.detected
-                                          ? 'bg-red-500'
-                                          : 'bg-emerald-500'
-                                      }`}></div>
-                                      <span className={`text-xs ${darkMode ? 'text-slate-300' : 'text-gray-700'}`}>
-                                        {engine}
-                                      </span>
-                                    </div>
-                                    <span className={`text-xs ${
-                                      result.detected
-                                        ? darkMode ? 'text-red-400 font-medium' : 'text-red-600 font-medium'
-                                        : darkMode ? 'text-slate-400' : 'text-gray-500'
-                                    }`}>
-                                      {result.detected ? result.result : 'Clean'}
-                                    </span>
-                                  </div>
-                                ))}
-                            </div>
-                            
-                            <a 
-                              href={selectedFile.analysisReport.staticAnalysis.virusTotal.permalink} 
-                              target="_blank" 
-                              rel="noopener noreferrer"
-                              className={`mt-3 text-xs flex items-center ${
-                                darkMode ? 'text-emerald-400 hover:text-emerald-300' : 'text-emerald-600 hover:text-emerald-700'
-                              }`}
-                            >
-                              View full report on VirusTotal
-                              <svg className="w-3 h-3 ml-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-                              </svg>
-                            </a>
                           </div>
                           
                           {/* Static Analysis Signatures */}
@@ -1482,11 +1506,11 @@ export default function Chat() {
                               Behavior Categories:
                             </h6>
                             <div className="flex flex-wrap gap-1">
-                              {selectedFile.analysisReport.dynamicAnalysis.summary.behaviorCategories.map((category, index) => (
+                              {selectedFile?.analysisReport?.dynamicAnalysis?.summary?.behaviorCategories.map((category, index) => (
                                 <span key={index} className={`text-xs px-2 py-0.5 rounded-full ${
-                                  selectedFile.analysisReport.dynamicAnalysis.summary.verdict === 'malicious'
+                                  selectedFile?.analysisReport?.dynamicAnalysis?.summary?.verdict === 'malicious'
                                     ? 'bg-red-100 text-red-800'
-                                    : selectedFile.analysisReport.dynamicAnalysis.summary.verdict === 'suspicious'
+                                    : selectedFile?.analysisReport?.dynamicAnalysis?.summary?.verdict === 'suspicious'
                                     ? 'bg-amber-100 text-amber-800'
                                     : 'bg-emerald-100 text-emerald-800'
                                 }`}>
@@ -1759,11 +1783,16 @@ export default function Chat() {
               Select Files
             </button>
             
+            {/* Scan button */}
             <button 
-              onClick={runFullScan} 
-              disabled={files.length === 0}
+              onClick={() => {
+                if (selectedFile && selectedFile.id && selectedFile.name) {
+                  runFullScan(selectedFile.id, selectedFile.name, scanLevel);
+                }
+              }}
+              disabled={!selectedFile || files.length === 0}
               className={`py-3 px-6 flex items-center justify-center font-medium rounded-lg ${
-                files.length === 0 
+                !selectedFile || files.length === 0
                   ? darkMode ? 'bg-slate-800/60 text-slate-500 cursor-not-allowed' : 'bg-gray-100 text-gray-400 cursor-not-allowed'
                   : darkMode ? 'bg-emerald-600 text-white hover:bg-emerald-700' : 'bg-emerald-600 text-white hover:bg-emerald-700'
               }`}
